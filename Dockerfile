@@ -46,8 +46,11 @@ RUN set -eux; \
     ffmpeg_pkg=jellyfin-ffmpeg8; apt-cache show "$ffmpeg_pkg" >/dev/null 2>&1 || ffmpeg_pkg=jellyfin-ffmpeg7; \
     apt-get install -y --no-install-recommends "$ffmpeg_pkg" cifs-utils tini tzdata \
       fontconfig fonts-liberation fonts-dejavu-core openssl util-linux xz-utils \
-      libatomic1; \
+      libatomic1 libjemalloc2; \
     # (libatomic1: Node 26 for arm64 needs it; without it node will not start)
+    # jemalloc for every process (see "Memory allocator" below)
+    jemalloc="/usr/lib/$(uname -m)-linux-gnu/libjemalloc.so.2"; test -f "$jemalloc"; \
+    echo "$jemalloc" > /etc/ld.so.preload; \
     ln -s /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/lib/jellyfin-ffmpeg/ffprobe /usr/lib/jellyfin-ffmpeg/vainfo /usr/local/bin/; \
     rm -rf /var/lib/apt/lists/*; \
     # no setuid/setgid programs: nothing inside can become root again (the
@@ -56,6 +59,13 @@ RUN set -eux; \
 
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=native /build/noreplace-rename /usr/local/bin/noreplace-rename
+# Memory allocator: jemalloc, loaded through /etc/ld.so.preload (above), so
+# it also reaches the app, whose environment the supervisor clears of
+# LD_PRELOAD. glibc kept the memory freed after the scrub previews: the app
+# settled at a median 169 MiB idle (RSS + swap, 3 runs on a 3,521-clip
+# archive), 102 MiB with jemalloc (stock image: 133), at 2% more CPU; libx265
+# encodes at the same speed with it. The build stops if node does not load it.
+RUN node -e "require('fs').readFileSync('/proc/self/maps','utf8').includes('libjemalloc') || process.exit(1)"
 
 ENV NODE_ENV=production \
     PORT=9000 \
@@ -91,6 +101,7 @@ RUN build=""; case "$BUILD_NUMBER" in ''|0*|*[!0-9]*) ;; *) build=",\"build\":$B
     printf '{"sha":"%s","branch":"%s","builtAt":"%s","image":"%s","tag":"%s"%s}\n' "$GIT_SHA" "$GIT_BRANCH" \
       "${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" "$IMAGE" "$IMAGE_TAG" "$build" > /app/BUILD_INFO.json
 
+# (Only for glibc's malloc, should jemalloc ever not be loaded.)
 # Two malloc arenas for the Node processes (the supervisor and the app):
 # with one per thread, memory freed after a large conversion job stayed with
 # the process (about 320 MB settled after three 48,000-clip jobs, 185 MB with
